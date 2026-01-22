@@ -27,6 +27,7 @@ import (
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
+	"github.com/aws/aws-sdk-go-v2/feature/ec2/imds"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/sirupsen/logrus"
 	"go.mongodb.org/mongo-driver/bson/primitive"
@@ -198,12 +199,54 @@ func isKnownAWSSuffix(suffix string) bool {
 	}
 }
 
+func wrapLoadOption(fn config.LoadOptionsFunc) func(*config.LoadOptions) error {
+	return func(o *config.LoadOptions) error {
+		return fn(o)
+	}
+}
+
+func (p *proxy) imdsLoadOptions() []func(*config.LoadOptions) error {
+	if p.imdsMode == "" {
+		return nil
+	}
+
+	logrus.Debugf("IMDS mode override: %s", p.imdsMode)
+
+	switch p.imdsMode {
+	case "disabled":
+		_ = os.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+		_ = os.Setenv("AWS_EC2_METADATA_V1_DISABLED", "true")
+		return []func(*config.LoadOptions) error{
+			wrapLoadOption(config.WithEC2IMDSClientEnableState(imds.ClientDisabled)),
+		}
+	case "required":
+		_ = os.Unsetenv("AWS_EC2_METADATA_DISABLED")
+		_ = os.Setenv("AWS_EC2_METADATA_V1_DISABLED", "true")
+		return []func(*config.LoadOptions) error{
+			wrapLoadOption(config.WithEC2IMDSClientEnableState(imds.ClientEnabled)),
+		}
+	case "optional":
+		_ = os.Unsetenv("AWS_EC2_METADATA_DISABLED")
+		_ = os.Unsetenv("AWS_EC2_METADATA_V1_DISABLED")
+		return []func(*config.LoadOptions) error{
+			wrapLoadOption(config.WithEC2IMDSClientEnableState(imds.ClientEnabled)),
+		}
+	default:
+		return nil
+	}
+}
+
 func (p *proxy) getCredentials(ctx context.Context) (aws.Credentials, error) {
 	// Refresh credentials after expiration. Required for STS
 	if p.credentials == nil {
+		loadOptions := []func(*config.LoadOptions) error{
+			wrapLoadOption(config.WithRegion(p.region)),
+		}
+		loadOptions = append(loadOptions, p.imdsLoadOptions()...)
+
 		cfg, err := config.LoadDefaultConfig(
 			ctx,
-			config.WithRegion(p.region),
+			loadOptions...,
 		)
 		if err != nil {
 			logrus.Debugln(err)
