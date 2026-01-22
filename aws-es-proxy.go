@@ -21,6 +21,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -86,6 +87,7 @@ type proxy struct {
 	fileRequest     *os.File
 	fileResponse    *os.File
 	credentials     aws.CredentialsProvider
+	credMu          sync.RWMutex // Protects credentials field
 	httpClient      *http.Client
 	auth            bool
 	username        string
@@ -205,6 +207,9 @@ func wrapLoadOption(fn config.LoadOptionsFunc) func(*config.LoadOptions) error {
 	}
 }
 
+// imdsLoadOptions returns SDK v2 config options based on IMDS mode.
+// Note: Environment variables are set for compatibility with SDK credential chain,
+// but the primary control is through SDK v2 config options.
 func (p *proxy) imdsLoadOptions() []func(*config.LoadOptions) error {
 	if p.imdsMode == "" {
 		return nil
@@ -214,20 +219,32 @@ func (p *proxy) imdsLoadOptions() []func(*config.LoadOptions) error {
 
 	switch p.imdsMode {
 	case "disabled":
-		_ = os.Setenv("AWS_EC2_METADATA_DISABLED", "true")
-		_ = os.Setenv("AWS_EC2_METADATA_V1_DISABLED", "true")
+		if err := os.Setenv("AWS_EC2_METADATA_DISABLED", "true"); err != nil {
+			logrus.WithError(err).Warn("Failed to set AWS_EC2_METADATA_DISABLED")
+		}
+		if err := os.Setenv("AWS_EC2_METADATA_V1_DISABLED", "true"); err != nil {
+			logrus.WithError(err).Warn("Failed to set AWS_EC2_METADATA_V1_DISABLED")
+		}
 		return []func(*config.LoadOptions) error{
 			wrapLoadOption(config.WithEC2IMDSClientEnableState(imds.ClientDisabled)),
 		}
 	case "required":
-		_ = os.Unsetenv("AWS_EC2_METADATA_DISABLED")
-		_ = os.Setenv("AWS_EC2_METADATA_V1_DISABLED", "true")
+		if err := os.Unsetenv("AWS_EC2_METADATA_DISABLED"); err != nil {
+			logrus.WithError(err).Warn("Failed to unset AWS_EC2_METADATA_DISABLED")
+		}
+		if err := os.Setenv("AWS_EC2_METADATA_V1_DISABLED", "true"); err != nil {
+			logrus.WithError(err).Warn("Failed to set AWS_EC2_METADATA_V1_DISABLED")
+		}
 		return []func(*config.LoadOptions) error{
 			wrapLoadOption(config.WithEC2IMDSClientEnableState(imds.ClientEnabled)),
 		}
 	case "optional":
-		_ = os.Unsetenv("AWS_EC2_METADATA_DISABLED")
-		_ = os.Unsetenv("AWS_EC2_METADATA_V1_DISABLED")
+		if err := os.Unsetenv("AWS_EC2_METADATA_DISABLED"); err != nil {
+			logrus.WithError(err).Warn("Failed to unset AWS_EC2_METADATA_DISABLED")
+		}
+		if err := os.Unsetenv("AWS_EC2_METADATA_V1_DISABLED"); err != nil {
+			logrus.WithError(err).Warn("Failed to unset AWS_EC2_METADATA_V1_DISABLED")
+		}
 		return []func(*config.LoadOptions) error{
 			wrapLoadOption(config.WithEC2IMDSClientEnableState(imds.ClientEnabled)),
 		}
@@ -237,50 +254,70 @@ func (p *proxy) imdsLoadOptions() []func(*config.LoadOptions) error {
 }
 
 func (p *proxy) getCredentials(ctx context.Context) (aws.Credentials, error) {
-	// Refresh credentials after expiration. Required for STS
-	if p.credentials == nil {
-		loadOptions := []func(*config.LoadOptions) error{
-			wrapLoadOption(config.WithRegion(p.region)),
-		}
-		loadOptions = append(loadOptions, p.imdsLoadOptions()...)
+	// Fast path: check if credentials exist with read lock
+	p.credMu.RLock()
+	creds := p.credentials
+	p.credMu.RUnlock()
 
-		cfg, err := config.LoadDefaultConfig(
-			ctx,
-			loadOptions...,
-		)
-		if err != nil {
-			logrus.Debugln(err)
-			return aws.Credentials{}, err
-		}
-
-		awsRoleARN := os.Getenv("AWS_ROLE_ARN")
-		awsWebIdentityTokenFile := os.Getenv("AWS_WEB_IDENTITY_TOKEN_FILE")
-
-		var provider aws.CredentialsProvider
-		if awsRoleARN != "" && awsWebIdentityTokenFile != "" {
-			logrus.Infof("Using web identity credentials with role %s", awsRoleARN)
-			stsClient := sts.NewFromConfig(cfg)
-			provider = stscreds.NewWebIdentityRoleProvider(
-				stsClient,
-				awsRoleARN,
-				stscreds.IdentityTokenFile(awsWebIdentityTokenFile),
-			)
-		} else if p.assumeRole != "" {
-			logrus.Infof("Assuming credentials from %s", p.assumeRole)
-			stsClient := sts.NewFromConfig(cfg)
-			provider = stscreds.NewAssumeRoleProvider(stsClient, p.assumeRole, func(provider *stscreds.AssumeRoleOptions) {
-				provider.Duration = 17 * time.Minute
-			})
-		} else {
-			logrus.Infoln("Using default credentials")
-			provider = cfg.Credentials
-		}
-
-		p.credentials = aws.NewCredentialsCache(provider)
-		logrus.Infoln("Generated fresh AWS Credentials object")
+	if creds != nil {
+		return creds.Retrieve(ctx)
 	}
 
+	// Slow path: acquire write lock and initialize credentials
+	p.credMu.Lock()
+	defer p.credMu.Unlock()
+
+	// Double-check after acquiring write lock (another goroutine may have initialized)
+	if p.credentials != nil {
+		return p.credentials.Retrieve(ctx)
+	}
+
+	// Initialize credentials
+	loadOptions := []func(*config.LoadOptions) error{
+		wrapLoadOption(config.WithRegion(p.region)),
+	}
+	loadOptions = append(loadOptions, p.imdsLoadOptions()...)
+
+	cfg, err := config.LoadDefaultConfig(ctx, loadOptions...)
+	if err != nil {
+		logrus.Debugln(err)
+		return aws.Credentials{}, err
+	}
+
+	awsRoleARN := os.Getenv("AWS_ROLE_ARN")
+	awsWebIdentityTokenFile := os.Getenv("AWS_WEB_IDENTITY_TOKEN_FILE")
+
+	var provider aws.CredentialsProvider
+	if awsRoleARN != "" && awsWebIdentityTokenFile != "" {
+		logrus.Infof("Using web identity credentials with role %s", awsRoleARN)
+		stsClient := sts.NewFromConfig(cfg)
+		provider = stscreds.NewWebIdentityRoleProvider(
+			stsClient,
+			awsRoleARN,
+			stscreds.IdentityTokenFile(awsWebIdentityTokenFile),
+		)
+	} else if p.assumeRole != "" {
+		logrus.Infof("Assuming credentials from %s", p.assumeRole)
+		stsClient := sts.NewFromConfig(cfg)
+		provider = stscreds.NewAssumeRoleProvider(stsClient, p.assumeRole, func(o *stscreds.AssumeRoleOptions) {
+			o.Duration = 17 * time.Minute
+		})
+	} else {
+		logrus.Infoln("Using default credentials")
+		provider = cfg.Credentials
+	}
+
+	p.credentials = aws.NewCredentialsCache(provider)
+	logrus.Infoln("Generated fresh AWS Credentials object")
+
 	return p.credentials.Retrieve(ctx)
+}
+
+// invalidateCredentials safely clears the cached credentials, forcing refresh on next request.
+func (p *proxy) invalidateCredentials() {
+	p.credMu.Lock()
+	p.credentials = nil
+	p.credMu.Unlock()
 }
 
 func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -329,52 +366,68 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	addHeaders(r.Header, req.Header)
 
-	// Make signV4 optional
+	// Capture request body for potential retry
+	var payload []byte
 	if !p.nosignreq {
-		// Start AWS session from ENV, Shared Creds or EC2Role
-		creds, err := p.getCredentials(r.Context())
+		payload = replaceBody(req)
+	}
+
+	var resp *http.Response
+	const maxRetries = 2
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		// Make signV4 optional
+		if !p.nosignreq {
+			// Start AWS session from ENV, Shared Creds or EC2Role
+			creds, err := p.getCredentials(r.Context())
+			if err != nil {
+				p.invalidateCredentials()
+				logrus.Errorln("Failed to sign", err)
+				http.Error(w, "Failed to sign", http.StatusForbidden)
+				return
+			}
+
+			// Restore body for signing (needed on retry)
+			req.Body = io.NopCloser(bytes.NewReader(payload))
+
+			// Sign the request with AWSv4
+			payloadHash := sha256Hex(payload)
+			signer := v4.NewSigner()
+			if err := signer.SignHTTP(r.Context(), creds, req, payloadHash, p.service, p.region, time.Now()); err != nil {
+				p.invalidateCredentials()
+				logrus.Errorln("Failed to sign", err)
+				http.Error(w, "Failed to sign", http.StatusForbidden)
+				return
+			}
+		}
+
+		var err error
+		resp, err = p.httpClient.Do(req)
 		if err != nil {
-			p.credentials = nil
-			logrus.Errorln("Failed to sign", err)
-			http.Error(w, "Failed to sign", http.StatusForbidden)
+			logrus.Errorln(err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 
-		// Sign the request with AWSv4
-		payload := replaceBody(req)
-		payloadHash := sha256Hex(payload)
-		signer := v4.NewSigner()
-		if err := signer.SignHTTP(r.Context(), creds, req, payloadHash, p.service, p.region, time.Now()); err != nil {
-			p.credentials = nil
-			logrus.Errorln("Failed to sign", err)
-			http.Error(w, "Failed to sign", http.StatusForbidden)
-			return
-		}
-	}
-
-	resp, err := p.httpClient.Do(req)
-	if err != nil {
-		logrus.Errorln(err)
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	if !p.nosignreq {
-		// AWS credentials expired, need to generate fresh ones
-		if resp.StatusCode == 403 {
-			logrus.Errorln("Received 403 from AWSAuth, invalidating credentials for retrial")
-			p.credentials = nil
-
+		// Check for credential expiry and retry if this is the first attempt
+		if !p.nosignreq && resp.StatusCode == 403 && attempt < maxRetries-1 {
+			logrus.Warnln("Received 403 from AWS, invalidating credentials and retrying")
 			logrus.Debugln("Received Status code from AWS:", resp.StatusCode)
+
 			b := bytes.Buffer{}
 			if _, err := io.Copy(&b, resp.Body); err != nil {
 				logrus.WithError(err).Errorln("Failed to decode body")
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
 			}
+			resp.Body.Close()
+
 			logrus.Debugln("Received headers from AWS:", resp.Header)
-			logrus.Debugln("Received body from AWS:", string(b.Bytes()))
+			logrus.Debugln("Received body from AWS:", b.String())
+
+			p.invalidateCredentials()
+			continue
 		}
+
+		// Success or non-retryable error
+		break
 	}
 
 	defer resp.Body.Close()
