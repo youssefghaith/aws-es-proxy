@@ -129,6 +129,71 @@ func TestServeHTTPAddsAuthorizationHeader(t *testing.T) {
 	}
 }
 
+func TestBasicAuthRequired(t *testing.T) {
+	p := newProxy(
+		"https://test.us-west-2.es.amazonaws.com",
+		false,
+		false,
+		false,
+		false,
+		15,
+		true,
+		"user",
+		"pass",
+		"Realm",
+		false,
+		"",
+		"",
+	)
+	if err := p.parseEndpoint(); err != nil {
+		t.Fatalf("parseEndpoint failed: %v", err)
+	}
+	p.httpClient.Transport = &captureRoundTripper{}
+
+	req := httptest.NewRequest(http.MethodGet, "http://localhost:9200/", nil)
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", rec.Code)
+	}
+}
+
+func TestBasicAuthSuccess(t *testing.T) {
+	setEnv(t, "AWS_ACCESS_KEY_ID", "test-access-key")
+	setEnv(t, "AWS_SECRET_ACCESS_KEY", "test-secret-key")
+	setEnv(t, "AWS_SESSION_TOKEN", "")
+
+	p := newProxy(
+		"https://test.us-west-2.es.amazonaws.com",
+		false,
+		false,
+		false,
+		false,
+		15,
+		true,
+		"user",
+		"pass",
+		"Realm",
+		false,
+		"",
+		"",
+	)
+	if err := p.parseEndpoint(); err != nil {
+		t.Fatalf("parseEndpoint failed: %v", err)
+	}
+	p.httpClient.Transport = &captureRoundTripper{}
+
+	req := httptest.NewRequest(http.MethodGet, "http://localhost:9200/", nil)
+	req.SetBasicAuth("user", "pass")
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+}
+
 func TestIMDSDisabledSetsEnv(t *testing.T) {
 	setEnv(t, "AWS_ACCESS_KEY_ID", "test-access-key")
 	setEnv(t, "AWS_SECRET_ACCESS_KEY", "test-secret-key")
