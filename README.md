@@ -40,8 +40,10 @@ brew install aws-es-proxy
 * go1.20+
 
 ```sh
-go build github.com/abutaha/aws-es-proxy
+go build
 ```
+
+This will produce an `aws-es-proxy` binary in the current directory.
 
 ## Configuring Credentials
 
