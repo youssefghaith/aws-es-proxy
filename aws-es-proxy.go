@@ -90,6 +90,7 @@ type proxy struct {
 	realm           string
 	remoteTerminate bool
 	assumeRole      string
+	imdsMode        string
 }
 
 func newProxy(args ...interface{}) *proxy {
@@ -122,6 +123,7 @@ func newProxy(args ...interface{}) *proxy {
 		realm:           args[9].(string),
 		remoteTerminate: args[10].(bool),
 		assumeRole:      args[11].(string),
+		imdsMode:        args[12].(string),
 	}
 }
 
@@ -485,6 +487,7 @@ func main() {
 		timeout         int
 		remoteTerminate bool
 		assumeRole      string
+		imdsMode        string
 	)
 
 	flag.StringVar(&endpoint, "endpoint", "", "Amazon ElasticSearch Endpoint (e.g: https://dummy-host.eu-west-1.es.amazonaws.com)")
@@ -502,6 +505,7 @@ func main() {
 	flag.StringVar(&realm, "realm", "", "Authentication Required")
 	flag.BoolVar(&remoteTerminate, "remote-terminate", false, "Allow HTTP remote termination")
 	flag.StringVar(&assumeRole, "assume", "", "Optionally specify role to assume")
+	flag.StringVar(&imdsMode, "imds", "", "IMDS mode (optional|required|disabled)")
 	flag.Parse()
 
 	if endpoint == "" {
@@ -512,6 +516,15 @@ func main() {
 				"You can use either argument '-endpoint' OR environment variable 'ENDPOINT'.\n" +
 				"Please run with '-h' for a list of available arguments."
 			fmt.Println(text)
+			os.Exit(1)
+		}
+	}
+
+	if imdsMode != "" {
+		switch imdsMode {
+		case "optional", "required", "disabled":
+		default:
+			fmt.Println("Invalid -imds value. Allowed: optional|required|disabled")
 			os.Exit(1)
 		}
 	}
@@ -549,6 +562,7 @@ func main() {
 		realm,
 		remoteTerminate,
 		assumeRole,
+		imdsMode,
 	)
 
 	if err = p.parseEndpoint(); err != nil {
