@@ -10,6 +10,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
 )
 
 type captureRoundTripper struct {
@@ -51,6 +54,31 @@ func setEnv(t *testing.T, key, value string) {
 			_ = os.Unsetenv(key)
 		}
 	})
+}
+
+func TestParseEndpointAmazonAWS(t *testing.T) {
+	cases := []struct {
+		name     string
+		endpoint string
+		region   string
+		service  string
+	}{
+		{"es", "https://test.us-west-2.es.amazonaws.com", "us-west-2", "es"},
+		{"aoss", "https://test.us-west-2.aoss.amazonaws.com", "us-west-2", "aoss"},
+		{"nonaws", "https://elastic.example.com", "", ""},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newProxy(tc.endpoint, false, false, false, false, 15, false, "", "", "", false, "", "")
+			if err := p.parseEndpoint(); err != nil {
+				t.Fatalf("parseEndpoint failed: %v", err)
+			}
+			if p.region != tc.region || p.service != tc.service {
+				t.Fatalf("got region=%q service=%q", p.region, p.service)
+			}
+		})
+	}
 }
 
 func TestServeHTTPAddsAuthorizationHeader(t *testing.T) {
@@ -104,6 +132,71 @@ func TestServeHTTPAddsAuthorizationHeader(t *testing.T) {
 	}
 }
 
+func TestBasicAuthRequired(t *testing.T) {
+	p := newProxy(
+		"https://test.us-west-2.es.amazonaws.com",
+		false,
+		false,
+		false,
+		false,
+		15,
+		true,
+		"user",
+		"pass",
+		"Realm",
+		false,
+		"",
+		"",
+	)
+	if err := p.parseEndpoint(); err != nil {
+		t.Fatalf("parseEndpoint failed: %v", err)
+	}
+	p.httpClient.Transport = &captureRoundTripper{}
+
+	req := httptest.NewRequest(http.MethodGet, "http://localhost:9200/", nil)
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", rec.Code)
+	}
+}
+
+func TestBasicAuthSuccess(t *testing.T) {
+	setEnv(t, "AWS_ACCESS_KEY_ID", "test-access-key")
+	setEnv(t, "AWS_SECRET_ACCESS_KEY", "test-secret-key")
+	setEnv(t, "AWS_SESSION_TOKEN", "")
+
+	p := newProxy(
+		"https://test.us-west-2.es.amazonaws.com",
+		false,
+		false,
+		false,
+		false,
+		15,
+		true,
+		"user",
+		"pass",
+		"Realm",
+		false,
+		"",
+		"",
+	)
+	if err := p.parseEndpoint(); err != nil {
+		t.Fatalf("parseEndpoint failed: %v", err)
+	}
+	p.httpClient.Transport = &captureRoundTripper{}
+
+	req := httptest.NewRequest(http.MethodGet, "http://localhost:9200/", nil)
+	req.SetBasicAuth("user", "pass")
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+}
+
 func TestIMDSDisabledSetsEnv(t *testing.T) {
 	setEnv(t, "AWS_ACCESS_KEY_ID", "test-access-key")
 	setEnv(t, "AWS_SECRET_ACCESS_KEY", "test-secret-key")
@@ -139,6 +232,161 @@ func TestIMDSDisabledSetsEnv(t *testing.T) {
 	}
 	if os.Getenv("AWS_EC2_METADATA_V1_DISABLED") != "true" {
 		t.Fatalf("expected AWS_EC2_METADATA_V1_DISABLED to be true")
+	}
+}
+
+func TestIMDSEnvRequired(t *testing.T) {
+	setEnv(t, "AWS_EC2_METADATA_DISABLED", "")
+	setEnv(t, "AWS_EC2_METADATA_V1_DISABLED", "")
+
+	p := newProxy(
+		"https://test.us-west-2.es.amazonaws.com",
+		false,
+		false,
+		false,
+		false,
+		15,
+		false,
+		"",
+		"",
+		"",
+		false,
+		"",
+		"required",
+	)
+	if err := p.parseEndpoint(); err != nil {
+		t.Fatalf("parseEndpoint failed: %v", err)
+	}
+
+	if os.Getenv("AWS_EC2_METADATA_DISABLED") != "" {
+		t.Fatalf("expected AWS_EC2_METADATA_DISABLED unset")
+	}
+	if os.Getenv("AWS_EC2_METADATA_V1_DISABLED") != "true" {
+		t.Fatalf("expected AWS_EC2_METADATA_V1_DISABLED true")
+	}
+}
+
+func TestIMDSEnvOptional(t *testing.T) {
+	setEnv(t, "AWS_EC2_METADATA_DISABLED", "true")
+	setEnv(t, "AWS_EC2_METADATA_V1_DISABLED", "true")
+
+	p := newProxy(
+		"https://test.us-west-2.es.amazonaws.com",
+		false,
+		false,
+		false,
+		false,
+		15,
+		false,
+		"",
+		"",
+		"",
+		false,
+		"",
+		"optional",
+	)
+	if err := p.parseEndpoint(); err != nil {
+		t.Fatalf("parseEndpoint failed: %v", err)
+	}
+
+	if os.Getenv("AWS_EC2_METADATA_DISABLED") != "" {
+		t.Fatalf("expected AWS_EC2_METADATA_DISABLED unset")
+	}
+	if os.Getenv("AWS_EC2_METADATA_V1_DISABLED") != "" {
+		t.Fatalf("expected AWS_EC2_METADATA_V1_DISABLED unset")
+	}
+}
+
+func TestNoSignModeSkipsAuthHeaders(t *testing.T) {
+	p := newProxy(
+		"https://test.us-west-2.es.amazonaws.com",
+		false,
+		false,
+		false,
+		true,
+		15,
+		false,
+		"",
+		"",
+		"",
+		false,
+		"",
+		"",
+	)
+	if err := p.parseEndpoint(); err != nil {
+		t.Fatalf("parseEndpoint failed: %v", err)
+	}
+	rt := &captureRoundTripper{}
+	p.httpClient.Transport = rt
+
+	req := httptest.NewRequest(http.MethodGet, "http://localhost:9200/", nil)
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status code: %d", rec.Code)
+	}
+	capturedReq := rt.getReq()
+	if capturedReq == nil {
+		t.Fatalf("expected proxied request to be captured")
+	}
+	if capturedReq.Header.Get("Authorization") != "" {
+		t.Fatalf("expected no Authorization header")
+	}
+	if capturedReq.Header.Get("X-Amz-Date") != "" {
+		t.Fatalf("expected no X-Amz-Date header")
+	}
+}
+
+func TestSelectCredentialsProvider_WebIdentity(t *testing.T) {
+	setEnv(t, "AWS_ROLE_ARN", "arn:aws:iam::123456789012:role/test")
+	setEnv(t, "AWS_WEB_IDENTITY_TOKEN_FILE", "/tmp/token")
+
+	p := newProxy(
+		"https://test.us-west-2.es.amazonaws.com",
+		false,
+		false,
+		false,
+		false,
+		15,
+		false,
+		"",
+		"",
+		"",
+		false,
+		"",
+		"",
+	)
+
+	provider := p.selectCredentialsProvider(aws.Config{})
+	if _, ok := provider.(*stscreds.WebIdentityRoleProvider); !ok {
+		t.Fatalf("expected WebIdentityRoleProvider")
+	}
+}
+
+func TestSelectCredentialsProvider_AssumeRole(t *testing.T) {
+	setEnv(t, "AWS_ROLE_ARN", "")
+	setEnv(t, "AWS_WEB_IDENTITY_TOKEN_FILE", "")
+
+	p := newProxy(
+		"https://test.us-west-2.es.amazonaws.com",
+		false,
+		false,
+		false,
+		false,
+		15,
+		false,
+		"",
+		"",
+		"",
+		false,
+		"arn:aws:iam::123456789012:role/test",
+		"",
+	)
+
+	provider := p.selectCredentialsProvider(aws.Config{})
+	if _, ok := provider.(*stscreds.AssumeRoleProvider); !ok {
+		t.Fatalf("expected AssumeRoleProvider")
 	}
 }
 

@@ -292,33 +292,36 @@ func (p *proxy) getCredentials(ctx context.Context) (aws.Credentials, error) {
 		return aws.Credentials{}, err
 	}
 
-	awsRoleARN := os.Getenv("AWS_ROLE_ARN")
-	awsWebIdentityTokenFile := os.Getenv("AWS_WEB_IDENTITY_TOKEN_FILE")
-
-	var provider aws.CredentialsProvider
-	if awsRoleARN != "" && awsWebIdentityTokenFile != "" {
-		logrus.Infof("Using web identity credentials with role %s", awsRoleARN)
-		stsClient := sts.NewFromConfig(cfg)
-		provider = stscreds.NewWebIdentityRoleProvider(
-			stsClient,
-			awsRoleARN,
-			stscreds.IdentityTokenFile(awsWebIdentityTokenFile),
-		)
-	} else if p.assumeRole != "" {
-		logrus.Infof("Assuming credentials from %s", p.assumeRole)
-		stsClient := sts.NewFromConfig(cfg)
-		provider = stscreds.NewAssumeRoleProvider(stsClient, p.assumeRole, func(o *stscreds.AssumeRoleOptions) {
-			o.Duration = 17 * time.Minute
-		})
-	} else {
-		logrus.Infoln("Using default credentials")
-		provider = cfg.Credentials
-	}
+	provider := p.selectCredentialsProvider(cfg)
 
 	p.credentials = aws.NewCredentialsCache(provider)
 	logrus.Infoln("Generated fresh AWS Credentials object")
 
 	return p.credentials.Retrieve(ctx)
+}
+
+func (p *proxy) selectCredentialsProvider(cfg aws.Config) aws.CredentialsProvider {
+	awsRoleARN := os.Getenv("AWS_ROLE_ARN")
+	awsWebIdentityTokenFile := os.Getenv("AWS_WEB_IDENTITY_TOKEN_FILE")
+
+	if awsRoleARN != "" && awsWebIdentityTokenFile != "" {
+		logrus.Infof("Using web identity credentials with role %s", awsRoleARN)
+		stsClient := sts.NewFromConfig(cfg)
+		return stscreds.NewWebIdentityRoleProvider(
+			stsClient,
+			awsRoleARN,
+			stscreds.IdentityTokenFile(awsWebIdentityTokenFile),
+		)
+	}
+	if p.assumeRole != "" {
+		logrus.Infof("Assuming credentials from %s", p.assumeRole)
+		stsClient := sts.NewFromConfig(cfg)
+		return stscreds.NewAssumeRoleProvider(stsClient, p.assumeRole, func(o *stscreds.AssumeRoleOptions) {
+			o.Duration = 17 * time.Minute
+		})
+	}
+	logrus.Infoln("Using default credentials")
+	return cfg.Credentials
 }
 
 // invalidateCredentials safely clears the cached credentials, forcing refresh on next request.
