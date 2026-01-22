@@ -2,7 +2,10 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -20,12 +23,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
-	"github.com/aws/aws-sdk-go/aws/endpoints"
-	"github.com/aws/aws-sdk-go/aws/session"
-	v4 "github.com/aws/aws-sdk-go/aws/signer/v4"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/sirupsen/logrus"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"golang.org/x/net/publicsuffix"
@@ -82,7 +84,7 @@ type proxy struct {
 	nosignreq       bool
 	fileRequest     *os.File
 	fileResponse    *os.File
-	credentials     *credentials.Credentials
+	credentials     aws.CredentialsProvider
 	httpClient      *http.Client
 	auth            bool
 	username        string
@@ -131,7 +133,6 @@ func (p *proxy) parseEndpoint() error {
 	var (
 		link          *url.URL
 		err           error
-		isAWSEndpoint bool
 	)
 
 	if link, err = url.Parse(p.endpoint); err != nil {
@@ -169,71 +170,74 @@ func (p *proxy) parseEndpoint() error {
 			logrus.Debugln("Endpoint split is less than 2")
 		}
 
-		awsEndpoints := []string{}
-		for _, partition := range endpoints.DefaultPartitions() {
-			for region := range partition.Regions() {
-				awsEndpoints = append(awsEndpoints, fmt.Sprintf("%s.es.%s", region, partition.DNSSuffix()))
-				awsEndpoints = append(awsEndpoints, fmt.Sprintf("%s.aoss.%s", region, partition.DNSSuffix()))
+		if len(split) == 2 {
+			endpointParts := strings.Split(split[1], ".")
+			if len(endpointParts) >= 3 {
+				region := endpointParts[0]
+				service := endpointParts[1]
+				dnsSuffix := strings.Join(endpointParts[2:], ".")
+				if (service == "es" || service == "aoss") && isKnownAWSSuffix(dnsSuffix) {
+					logrus.Debugln("Provided endpoint is a valid AWS Elasticsearch endpoint")
+					p.region = region
+					p.service = service
+					logrus.Debugln("AWS Region", p.region)
+				}
 			}
-		}
-
-		isAWSEndpoint = false
-		for _, v := range awsEndpoints {
-			if split[1] == v {
-				logrus.Debugln("Provided endpoint is a valid AWS Elasticsearch endpoint")
-				isAWSEndpoint = true
-				break
-			}
-		}
-
-		if isAWSEndpoint {
-			// Extract region and service from link. This should be save now
-			parts := strings.Split(link.Host, ".")
-			p.region, p.service = parts[1], parts[2]
-			logrus.Debugln("AWS Region", p.region)
 		}
 	}
 
 	return nil
 }
 
-func (p *proxy) getSigner() *v4.Signer {
+func isKnownAWSSuffix(suffix string) bool {
+	switch suffix {
+	case "amazonaws.com", "amazonaws.com.cn", "amazonaws-us-gov.com", "c2s.ic.gov", "sc2s.sgov.gov":
+		return true
+	default:
+		return false
+	}
+}
+
+func (p *proxy) getCredentials(ctx context.Context) (aws.Credentials, error) {
 	// Refresh credentials after expiration. Required for STS
 	if p.credentials == nil {
-		sess, err := session.NewSession(
-			&aws.Config{
-				Region:                        aws.String(p.region),
-				CredentialsChainVerboseErrors: aws.Bool(true),
-			},
+		cfg, err := config.LoadDefaultConfig(
+			ctx,
+			config.WithRegion(p.region),
 		)
 		if err != nil {
 			logrus.Debugln(err)
+			return aws.Credentials{}, err
 		}
 
 		awsRoleARN := os.Getenv("AWS_ROLE_ARN")
 		awsWebIdentityTokenFile := os.Getenv("AWS_WEB_IDENTITY_TOKEN_FILE")
 
-		var creds *credentials.Credentials
+		var provider aws.CredentialsProvider
 		if awsRoleARN != "" && awsWebIdentityTokenFile != "" {
 			logrus.Infof("Using web identity credentials with role %s", awsRoleARN)
-			creds = stscreds.NewWebIdentityCredentials(sess, awsRoleARN, "", awsWebIdentityTokenFile)
+			stsClient := sts.NewFromConfig(cfg)
+			provider = stscreds.NewWebIdentityRoleProvider(
+				stsClient,
+				awsRoleARN,
+				stscreds.IdentityTokenFile(awsWebIdentityTokenFile),
+			)
 		} else if p.assumeRole != "" {
 			logrus.Infof("Assuming credentials from %s", p.assumeRole)
-			creds = stscreds.NewCredentials(sess, p.assumeRole, func(provider *stscreds.AssumeRoleProvider) {
+			stsClient := sts.NewFromConfig(cfg)
+			provider = stscreds.NewAssumeRoleProvider(stsClient, p.assumeRole, func(provider *stscreds.AssumeRoleOptions) {
 				provider.Duration = 17 * time.Minute
-				provider.ExpiryWindow = 13 * time.Minute
-				provider.MaxJitterFrac = 0.1
 			})
 		} else {
 			logrus.Infoln("Using default credentials")
-			creds = sess.Config.Credentials
+			provider = cfg.Credentials
 		}
 
-		p.credentials = creds
+		p.credentials = aws.NewCredentialsCache(provider)
 		logrus.Infoln("Generated fresh AWS Credentials object")
 	}
 
-	return v4.NewSigner(p.credentials)
+	return p.credentials.Retrieve(ctx)
 }
 
 func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -285,12 +289,19 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Make signV4 optional
 	if !p.nosignreq {
 		// Start AWS session from ENV, Shared Creds or EC2Role
-		signer := p.getSigner()
+		creds, err := p.getCredentials(r.Context())
+		if err != nil {
+			p.credentials = nil
+			logrus.Errorln("Failed to sign", err)
+			http.Error(w, "Failed to sign", http.StatusForbidden)
+			return
+		}
 
 		// Sign the request with AWSv4
-		payload := bytes.NewReader(replaceBody(req))
-		_, err := signer.Sign(req, payload, p.service, p.region, time.Now())
-		if err != nil {
+		payload := replaceBody(req)
+		payloadHash := sha256Hex(payload)
+		signer := v4.NewSigner()
+		if err := signer.SignHTTP(r.Context(), creds, req, payloadHash, p.service, p.region, time.Now()); err != nil {
 			p.credentials = nil
 			logrus.Errorln("Failed to sign", err)
 			http.Error(w, "Failed to sign", http.StatusForbidden)
@@ -443,6 +454,11 @@ func addHeaders(src, dest http.Header) {
 	if val, ok := src["Authorization"]; ok {
 		dest.Add("Authorization", val[0])
 	}
+}
+
+func sha256Hex(payload []byte) string {
+	sum := sha256.Sum256(payload)
+	return hex.EncodeToString(sum[:])
 }
 
 // Signer.Sign requires a "seekable" body to sum body's sha256
