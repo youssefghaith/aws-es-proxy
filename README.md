@@ -6,6 +6,18 @@
 
 Kibana requests are also signed automatically.
 
+## What's New in This Fork
+
+This fork includes several improvements over the [original repository](https://github.com/abutaha/aws-es-proxy):
+
+- **AWS SDK v2 Migration**: Upgraded from deprecated AWS SDK v1 to v2 for better performance and security
+- **Multi-arch Docker Images**: Native support for both `amd64` and `arm64` architectures
+- **IMDSv2 Support**: Full support for EC2 Instance Metadata Service v2 with configurable modes (`-imds` flag)
+- **Thread-safe Credentials**: Fixed race conditions in credential management for concurrent requests
+- **Smart Retry Logic**: Automatic retry on credential expiry (403 errors) for idempotent requests
+- **Comprehensive Tests**: 16 test cases covering concurrency, IMDS, retry logic, and edge cases
+- **OpenSearch Dashboards Ready**: Optimized timeout defaults and documentation for dashboard usage
+
 ## Installation
 
 ### Download binary executable
