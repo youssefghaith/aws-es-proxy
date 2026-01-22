@@ -232,6 +232,68 @@ func TestIMDSDisabledSetsEnv(t *testing.T) {
 	}
 }
 
+func TestIMDSEnvRequired(t *testing.T) {
+	setEnv(t, "AWS_EC2_METADATA_DISABLED", "")
+	setEnv(t, "AWS_EC2_METADATA_V1_DISABLED", "")
+
+	p := newProxy(
+		"https://test.us-west-2.es.amazonaws.com",
+		false,
+		false,
+		false,
+		false,
+		15,
+		false,
+		"",
+		"",
+		"",
+		false,
+		"",
+		"required",
+	)
+	if err := p.parseEndpoint(); err != nil {
+		t.Fatalf("parseEndpoint failed: %v", err)
+	}
+
+	if os.Getenv("AWS_EC2_METADATA_DISABLED") != "" {
+		t.Fatalf("expected AWS_EC2_METADATA_DISABLED unset")
+	}
+	if os.Getenv("AWS_EC2_METADATA_V1_DISABLED") != "true" {
+		t.Fatalf("expected AWS_EC2_METADATA_V1_DISABLED true")
+	}
+}
+
+func TestIMDSEnvOptional(t *testing.T) {
+	setEnv(t, "AWS_EC2_METADATA_DISABLED", "true")
+	setEnv(t, "AWS_EC2_METADATA_V1_DISABLED", "true")
+
+	p := newProxy(
+		"https://test.us-west-2.es.amazonaws.com",
+		false,
+		false,
+		false,
+		false,
+		15,
+		false,
+		"",
+		"",
+		"",
+		false,
+		"",
+		"optional",
+	)
+	if err := p.parseEndpoint(); err != nil {
+		t.Fatalf("parseEndpoint failed: %v", err)
+	}
+
+	if os.Getenv("AWS_EC2_METADATA_DISABLED") != "" {
+		t.Fatalf("expected AWS_EC2_METADATA_DISABLED unset")
+	}
+	if os.Getenv("AWS_EC2_METADATA_V1_DISABLED") != "" {
+		t.Fatalf("expected AWS_EC2_METADATA_V1_DISABLED unset")
+	}
+}
+
 // TestConcurrentCredentialAccess tests that concurrent requests don't race on credentials
 func TestConcurrentCredentialAccess(t *testing.T) {
 	setEnv(t, "AWS_ACCESS_KEY_ID", "test-access-key")
