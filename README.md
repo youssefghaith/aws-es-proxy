@@ -16,17 +16,14 @@ Download the latest [aws-es-proxy release](https://github.com/abutaha/aws-es-pro
 
 ### Docker
 
-There is an official docker image available for aws-es-proxy. To run the image:
+Docker images are available on GitHub Container Registry:
 
 ```sh
-# v0.9 and newer (latest always point to the latest release):
+# Using GHCR (recommended):
+docker run --rm -v ~/.aws:/root/.aws -p 9200:9200 ghcr.io/youssefghaith/aws-es-proxy:latest -endpoint https://dummy-host.ap-southeast-2.es.amazonaws.com -listen 0.0.0.0:9200
 
-docker run --rm -v ~/.aws:/root/.aws -p 9200:9200 abutaha/aws-es-proxy:v1.0 -endpoint https://dummy-host.ap-southeast-2.es.amazonaws.com -listen 0.0.0.0:9200
-
-v.08:
-
-docker run --rm -it abutaha/aws-es-proxy ./aws-es-proxy -endpoint https://dummy-host.ap-southeast-2.es.amazonaws.com
-
+# With specific version:
+docker run --rm -v ~/.aws:/root/.aws -p 9200:9200 ghcr.io/youssefghaith/aws-es-proxy:1.6 -endpoint https://dummy-host.ap-southeast-2.es.amazonaws.com -listen 0.0.0.0:9200
 ```
 
 To expose a port number other than the default 9200, pass an environment variable of `PORT_NUM` to docker with the port number you wish to expose for your service.
@@ -40,10 +37,9 @@ brew install aws-es-proxy
 ### Build from Source
 
 #### Dependencies:
-* go1.14+
+* go1.20+
 
 ```sh
-#requires go1.14
 go build github.com/abutaha/aws-es-proxy
 ```
 
