@@ -10,6 +10,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
 )
 
 type captureRoundTripper struct {
@@ -332,6 +335,58 @@ func TestNoSignModeSkipsAuthHeaders(t *testing.T) {
 	}
 	if capturedReq.Header.Get("X-Amz-Date") != "" {
 		t.Fatalf("expected no X-Amz-Date header")
+	}
+}
+
+func TestSelectCredentialsProvider_WebIdentity(t *testing.T) {
+	setEnv(t, "AWS_ROLE_ARN", "arn:aws:iam::123456789012:role/test")
+	setEnv(t, "AWS_WEB_IDENTITY_TOKEN_FILE", "/tmp/token")
+
+	p := newProxy(
+		"https://test.us-west-2.es.amazonaws.com",
+		false,
+		false,
+		false,
+		false,
+		15,
+		false,
+		"",
+		"",
+		"",
+		false,
+		"",
+		"",
+	)
+
+	provider := p.selectCredentialsProvider(aws.Config{})
+	if _, ok := provider.(*stscreds.WebIdentityRoleProvider); !ok {
+		t.Fatalf("expected WebIdentityRoleProvider")
+	}
+}
+
+func TestSelectCredentialsProvider_AssumeRole(t *testing.T) {
+	setEnv(t, "AWS_ROLE_ARN", "")
+	setEnv(t, "AWS_WEB_IDENTITY_TOKEN_FILE", "")
+
+	p := newProxy(
+		"https://test.us-west-2.es.amazonaws.com",
+		false,
+		false,
+		false,
+		false,
+		15,
+		false,
+		"",
+		"",
+		"",
+		false,
+		"arn:aws:iam::123456789012:role/test",
+		"",
+	)
+
+	provider := p.selectCredentialsProvider(aws.Config{})
+	if _, ok := provider.(*stscreds.AssumeRoleProvider); !ok {
+		t.Fatalf("expected AssumeRoleProvider")
 	}
 }
 
