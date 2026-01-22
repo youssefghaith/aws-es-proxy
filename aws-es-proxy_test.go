@@ -294,6 +294,47 @@ func TestIMDSEnvOptional(t *testing.T) {
 	}
 }
 
+func TestNoSignModeSkipsAuthHeaders(t *testing.T) {
+	p := newProxy(
+		"https://test.us-west-2.es.amazonaws.com",
+		false,
+		false,
+		false,
+		true,
+		15,
+		false,
+		"",
+		"",
+		"",
+		false,
+		"",
+		"",
+	)
+	if err := p.parseEndpoint(); err != nil {
+		t.Fatalf("parseEndpoint failed: %v", err)
+	}
+	rt := &captureRoundTripper{}
+	p.httpClient.Transport = rt
+
+	req := httptest.NewRequest(http.MethodGet, "http://localhost:9200/", nil)
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status code: %d", rec.Code)
+	}
+	capturedReq := rt.getReq()
+	if capturedReq == nil {
+		t.Fatalf("expected proxied request to be captured")
+	}
+	if capturedReq.Header.Get("Authorization") != "" {
+		t.Fatalf("expected no Authorization header")
+	}
+	if capturedReq.Header.Get("X-Amz-Date") != "" {
+		t.Fatalf("expected no X-Amz-Date header")
+	}
+}
+
 // TestConcurrentCredentialAccess tests that concurrent requests don't race on credentials
 func TestConcurrentCredentialAccess(t *testing.T) {
 	setEnv(t, "AWS_ACCESS_KEY_ID", "test-access-key")
