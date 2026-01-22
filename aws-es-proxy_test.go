@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
@@ -619,4 +621,107 @@ func TestInvalidateCredentials(t *testing.T) {
 		t.Fatalf("expected credentials to be nil after invalidation")
 	}
 	p.credMu.RUnlock()
+}
+
+// timeoutRoundTripper simulates IMDS timeout
+type timeoutRoundTripper struct{}
+
+func (t *timeoutRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	// Simulate IMDS timeout for metadata endpoint
+	if req.URL.Host == "169.254.169.254" {
+		return nil, errors.New("Put \"http://169.254.169.254/latest/api/token\": net/http: timeout awaiting response headers")
+	}
+	// Allow other requests to succeed
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(bytes.NewBufferString(`{}`)),
+		Header:     make(http.Header),
+		Request:    req,
+	}, nil
+}
+
+// TestIMDSTimeoutHandling tests graceful failure when IMDS is unreachable
+func TestIMDSTimeoutHandling(t *testing.T) {
+	// Clear all AWS credentials to force IMDS lookup
+	setEnv(t, "AWS_ACCESS_KEY_ID", "")
+	setEnv(t, "AWS_SECRET_ACCESS_KEY", "")
+	setEnv(t, "AWS_SESSION_TOKEN", "")
+	setEnv(t, "AWS_ROLE_ARN", "")
+	setEnv(t, "AWS_WEB_IDENTITY_TOKEN_FILE", "")
+
+	p := newProxy(
+		"https://test.us-west-2.es.amazonaws.com",
+		false,
+		false,
+		false,
+		false,
+		15,
+		false,
+		"",
+		"",
+		"",
+		false,
+		"",
+		"", // Don't disable IMDS, let it try and fail
+	)
+	if err := p.parseEndpoint(); err != nil {
+		t.Fatalf("parseEndpoint failed: %v", err)
+	}
+
+	// This should timeout when trying to reach IMDS
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	_, err := p.getCredentials(ctx)
+	if err == nil {
+		t.Fatalf("expected error when IMDS unreachable and no credentials available")
+	}
+
+	// Error should mention credentials/IMDS failure
+	errMsg := err.Error()
+	if errMsg == "" {
+		t.Fatalf("expected non-empty error message")
+	}
+}
+
+// TestIMDSDisabledSkipsTimeout tests that -imds disabled prevents IMDS lookup
+func TestIMDSDisabledSkipsTimeout(t *testing.T) {
+	// Clear all AWS credentials
+	setEnv(t, "AWS_ACCESS_KEY_ID", "")
+	setEnv(t, "AWS_SECRET_ACCESS_KEY", "")
+	setEnv(t, "AWS_SESSION_TOKEN", "")
+
+	p := newProxy(
+		"https://test.us-west-2.es.amazonaws.com",
+		false,
+		false,
+		false,
+		false,
+		15,
+		false,
+		"",
+		"",
+		"",
+		false,
+		"",
+		"disabled", // IMDS disabled - should fail fast
+	)
+	if err := p.parseEndpoint(); err != nil {
+		t.Fatalf("parseEndpoint failed: %v", err)
+	}
+
+	// Should fail quickly without trying IMDS
+	start := time.Now()
+	ctx := context.Background()
+	_, err := p.getCredentials(ctx)
+	duration := time.Since(start)
+
+	if err == nil {
+		t.Fatalf("expected error when no credentials available")
+	}
+
+	// Should fail in less than 1 second (not waiting for IMDS timeout)
+	if duration > time.Second {
+		t.Fatalf("getCredentials took too long (%v), expected fast failure with IMDS disabled", duration)
+	}
 }
