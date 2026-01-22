@@ -130,6 +130,8 @@ Usage of ./aws-es-proxy:
         Print debug messages
   -endpoint string
         Amazon ElasticSearch Endpoint (e.g: https://dummy-host.eu-west-1.es.amazonaws.com)
+  -imds string
+        IMDS mode (optional|required|disabled); overrides AWS config/env
   -listen string
         Local TCP port to listen on (default "127.0.0.1:9200")
   -log-to-file
