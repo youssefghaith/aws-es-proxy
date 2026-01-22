@@ -189,6 +189,9 @@ func (p *proxy) parseEndpoint() error {
 		}
 	}
 
+	// Setup IMDS environment variables once at startup
+	p.setupIMDSEnv()
+
 	return nil
 }
 
@@ -207,12 +210,11 @@ func wrapLoadOption(fn config.LoadOptionsFunc) func(*config.LoadOptions) error {
 	}
 }
 
-// imdsLoadOptions returns SDK v2 config options based on IMDS mode.
-// Note: Environment variables are set for compatibility with SDK credential chain,
-// but the primary control is through SDK v2 config options.
-func (p *proxy) imdsLoadOptions() []func(*config.LoadOptions) error {
+// setupIMDSEnv configures IMDS-related environment variables once at startup.
+// This should be called during initialization, not on every credential refresh.
+func (p *proxy) setupIMDSEnv() {
 	if p.imdsMode == "" {
-		return nil
+		return
 	}
 
 	logrus.Debugf("IMDS mode override: %s", p.imdsMode)
@@ -225,18 +227,12 @@ func (p *proxy) imdsLoadOptions() []func(*config.LoadOptions) error {
 		if err := os.Setenv("AWS_EC2_METADATA_V1_DISABLED", "true"); err != nil {
 			logrus.WithError(err).Warn("Failed to set AWS_EC2_METADATA_V1_DISABLED")
 		}
-		return []func(*config.LoadOptions) error{
-			wrapLoadOption(config.WithEC2IMDSClientEnableState(imds.ClientDisabled)),
-		}
 	case "required":
 		if err := os.Unsetenv("AWS_EC2_METADATA_DISABLED"); err != nil {
 			logrus.WithError(err).Warn("Failed to unset AWS_EC2_METADATA_DISABLED")
 		}
 		if err := os.Setenv("AWS_EC2_METADATA_V1_DISABLED", "true"); err != nil {
 			logrus.WithError(err).Warn("Failed to set AWS_EC2_METADATA_V1_DISABLED")
-		}
-		return []func(*config.LoadOptions) error{
-			wrapLoadOption(config.WithEC2IMDSClientEnableState(imds.ClientEnabled)),
 		}
 	case "optional":
 		if err := os.Unsetenv("AWS_EC2_METADATA_DISABLED"); err != nil {
@@ -245,6 +241,18 @@ func (p *proxy) imdsLoadOptions() []func(*config.LoadOptions) error {
 		if err := os.Unsetenv("AWS_EC2_METADATA_V1_DISABLED"); err != nil {
 			logrus.WithError(err).Warn("Failed to unset AWS_EC2_METADATA_V1_DISABLED")
 		}
+	}
+}
+
+// imdsLoadOptions returns SDK v2 config options based on IMDS mode.
+// Environment variables should be set separately via setupIMDSEnv() at startup.
+func (p *proxy) imdsLoadOptions() []func(*config.LoadOptions) error {
+	switch p.imdsMode {
+	case "disabled":
+		return []func(*config.LoadOptions) error{
+			wrapLoadOption(config.WithEC2IMDSClientEnableState(imds.ClientDisabled)),
+		}
+	case "required", "optional":
 		return []func(*config.LoadOptions) error{
 			wrapLoadOption(config.WithEC2IMDSClientEnableState(imds.ClientEnabled)),
 		}
@@ -409,7 +417,9 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Check for credential expiry and retry if this is the first attempt
-		if !p.nosignreq && resp.StatusCode == 403 && attempt < maxRetries-1 {
+		// Only retry idempotent methods to avoid duplicating side effects
+		isIdempotent := r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions
+		if !p.nosignreq && resp.StatusCode == 403 && attempt < maxRetries-1 && isIdempotent {
 			logrus.Warnln("Received 403 from AWS, invalidating credentials and retrying")
 			logrus.Debugln("Received Status code from AWS:", resp.StatusCode)
 

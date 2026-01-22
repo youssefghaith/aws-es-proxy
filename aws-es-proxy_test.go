@@ -13,11 +13,14 @@ import (
 )
 
 type captureRoundTripper struct {
+	mu  sync.Mutex
 	req *http.Request
 }
 
 func (c *captureRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	c.mu.Lock()
 	c.req = req
+	c.mu.Unlock()
 	body := io.NopCloser(bytes.NewBufferString(`{}`))
 	return &http.Response{
 		StatusCode: http.StatusOK,
@@ -25,6 +28,12 @@ func (c *captureRoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 		Header:     make(http.Header),
 		Request:    req,
 	}, nil
+}
+
+func (c *captureRoundTripper) getReq() *http.Request {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.req
 }
 
 func setEnv(t *testing.T, key, value string) {
@@ -79,17 +88,18 @@ func TestServeHTTPAddsAuthorizationHeader(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("unexpected status code: %d", rec.Code)
 	}
-	if rt.req == nil {
+	capturedReq := rt.getReq()
+	if capturedReq == nil {
 		t.Fatalf("expected proxied request to be captured")
 	}
-	if rt.req.Header.Get("Authorization") == "" {
+	if capturedReq.Header.Get("Authorization") == "" {
 		t.Fatalf("expected Authorization header to be set")
 	}
-	if rt.req.Header.Get("X-Amz-Date") == "" {
+	if capturedReq.Header.Get("X-Amz-Date") == "" {
 		t.Fatalf("expected X-Amz-Date header to be set")
 	}
 	expectedHash := sha256Hex([]byte{})
-	if got := rt.req.Header.Get("X-Amz-Content-Sha256"); got != "" && got != expectedHash {
+	if got := capturedReq.Header.Get("X-Amz-Content-Sha256"); got != "" && got != expectedHash {
 		t.Fatalf("expected X-Amz-Content-Sha256 to be %s when set", expectedHash)
 	}
 }
@@ -265,6 +275,51 @@ func TestRetryOn403(t *testing.T) {
 	p.credMu.RUnlock()
 	if creds == nil {
 		t.Fatalf("expected credentials to be regenerated after retry")
+	}
+}
+
+// TestNoRetryOn403ForPOST tests that POST requests do NOT retry on 403
+func TestNoRetryOn403ForPOST(t *testing.T) {
+	setEnv(t, "AWS_ACCESS_KEY_ID", "test-access-key")
+	setEnv(t, "AWS_SECRET_ACCESS_KEY", "test-secret-key")
+	setEnv(t, "AWS_SESSION_TOKEN", "")
+
+	p := newProxy(
+		"https://vpc-test.us-west-2.es.amazonaws.com",
+		false,
+		false,
+		false,
+		false,
+		15,
+		false,
+		"",
+		"",
+		"",
+		false,
+		"",
+		"disabled",
+	)
+	if err := p.parseEndpoint(); err != nil {
+		t.Fatalf("parseEndpoint failed: %v", err)
+	}
+
+	rt := &retryRoundTripper{}
+	p.httpClient.Transport = rt
+
+	// Use POST method which is not idempotent
+	req := httptest.NewRequest(http.MethodPost, "http://localhost:9200/_bulk", bytes.NewBufferString(`{}`))
+	rec := httptest.NewRecorder()
+
+	p.ServeHTTP(rec, req)
+
+	// Should NOT have retried - return 403 directly
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected status 403 (no retry for POST), got %d", rec.Code)
+	}
+
+	// Should have made only 1 request (no retry)
+	if rt.callCount.Load() != 1 {
+		t.Fatalf("expected 1 HTTP call (no retry for POST), got %d", rt.callCount.Load())
 	}
 }
 
