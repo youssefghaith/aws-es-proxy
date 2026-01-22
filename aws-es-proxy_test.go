@@ -53,6 +53,31 @@ func setEnv(t *testing.T, key, value string) {
 	})
 }
 
+func TestParseEndpointAmazonAWS(t *testing.T) {
+	cases := []struct {
+		name     string
+		endpoint string
+		region   string
+		service  string
+	}{
+		{"es", "https://test.us-west-2.es.amazonaws.com", "us-west-2", "es"},
+		{"aoss", "https://test.us-west-2.aoss.amazonaws.com", "us-west-2", "aoss"},
+		{"nonaws", "https://elastic.example.com", "", ""},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newProxy(tc.endpoint, false, false, false, false, 15, false, "", "", "", false, "", "")
+			if err := p.parseEndpoint(); err != nil {
+				t.Fatalf("parseEndpoint failed: %v", err)
+			}
+			if p.region != tc.region || p.service != tc.service {
+				t.Fatalf("got region=%q service=%q", p.region, p.service)
+			}
+		})
+	}
+}
+
 func TestServeHTTPAddsAuthorizationHeader(t *testing.T) {
 	setEnv(t, "AWS_ACCESS_KEY_ID", "test-access-key")
 	setEnv(t, "AWS_SECRET_ACCESS_KEY", "test-secret-key")
