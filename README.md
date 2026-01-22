@@ -78,7 +78,58 @@ export AWS_SECRET_ACCESS_KEY=MY-SECRET-KEY
 }
 ```
 
+### IMDS (EC2 Instance Metadata Service) Configuration
 
+When running on EC2 instances, **aws-es-proxy** can automatically fetch credentials from the instance's IAM role via IMDS. Use the `-imds` flag to control this behavior:
+
+```sh
+-imds disabled   # Never use IMDS (use env vars or ~/.aws/credentials)
+-imds required   # Must use IMDS with IMDSv2 only (most secure)
+-imds optional   # Try IMDS first, fall back to other credential sources
+```
+
+**When to use each mode:**
+
+- **`-imds disabled`**: Use when running locally, in Docker containers outside EC2, or when you want to use explicit credentials
+- **`-imds required`**: Use on EC2 instances with IAM roles for maximum security (enforces IMDSv2)
+- **`-imds optional`**: Use on EC2 when you want IMDS but with fallback to other credential sources
+
+**Docker considerations:**
+
+When running in Docker containers on EC2, you must use `--network host` for IMDS to work:
+
+```sh
+# On EC2 with IAM role - use host networking
+docker run -d --name aws-es-proxy \
+  --restart unless-stopped \
+  --network host \
+  ghcr.io/youssefghaith/aws-es-proxy:latest \
+  -imds required \
+  -endpoint https://your-domain.es.amazonaws.com \
+  -listen 0.0.0.0:9200 \
+  -timeout 120
+```
+
+Without `--network host`, you'll get timeout errors trying to reach IMDS at `169.254.169.254`.
+
+**Timeout considerations:**
+
+If you're using **OpenSearch Dashboards** or **Kibana**, increase the timeout to at least 120 seconds. The default 15-second timeout is insufficient for loading large dashboard JavaScript bundles, causing "context deadline exceeded" errors. Add `-timeout 120` to your docker run command.
+
+**For non-EC2 environments** (local development, Kubernetes, ECS with bridge networking):
+
+```sh
+docker run -d --name aws-es-proxy \
+  -p 9200:9200 \
+  -e AWS_ACCESS_KEY_ID=AKIAXXXXXXXXXXXXXXXX \
+  -e AWS_SECRET_ACCESS_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx \
+  -e AWS_REGION=us-east-1 \
+  ghcr.io/youssefghaith/aws-es-proxy:latest \
+  -imds disabled \
+  -endpoint https://your-domain.es.amazonaws.com \
+  -listen 0.0.0.0:9200 \
+  -timeout 120
+```
 
 ## Usage example:
 
